@@ -24,6 +24,8 @@ MAX_RETRIES = 3
 RETRY_BACKOFF = 1.5
 CRAWL_DELAY = 0.3
 
+SEARXNG_URL = os.getenv("SEARXNG_URL", "")
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("powerscrapper")
 
@@ -92,7 +94,36 @@ def fetch_with_retry(url: str, retries: int = MAX_RETRIES) -> Optional[str]:
                 logger.error(f"Failed to fetch {url}: {e}")
     return None
 
-# ─── Search: Bing (primary) + DuckDuckGo (fallback) ─────────────────────────
+# ─── Search: SearXNG (primary if configured) + Bing + DuckDuckGo (fallbacks) ──
+def search_searxng(query: str, count: int) -> list[str]:
+    """Search using self-hosted SearXNG JSON API. No API key needed."""
+    if not SEARXNG_URL:
+        return []
+    base = SEARXNG_URL.rstrip("/")
+    try:
+        r = requests.get(
+            f"{base}/search",
+            params={"q": query, "format": "json", "pageno": 1},
+            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+            timeout=20,
+        )
+        if r.status_code != 200:
+            logger.warning(f"SearXNG returned {r.status_code}")
+            return []
+        data = r.json()
+        urls = []
+        for result in data.get("results", []):
+            url = result.get("url", "")
+            if url and url.startswith("http"):
+                urls.append(url)
+            if len(urls) >= count:
+                break
+        logger.info(f"SearXNG: {len(urls)} results for '{query[:60]}'")
+        return urls
+    except Exception as e:
+        logger.warning(f"SearXNG error: {e}")
+        return []
+
 def search_bing(query: str, count: int) -> list[str]:
     """Search using Bing HTML — no API key needed."""
     urls = []
@@ -158,12 +189,18 @@ def search_ddg(query: str, count: int) -> list[str]:
         return []
 
 def search(query: str, count: int) -> list[str]:
-    """Search with Bing first, DDG fallback."""
-    results = search_bing(query, count)
+    """Search with SearXNG (if configured) first, then Bing, then DDG."""
+    results = search_searxng(query, count) if SEARXNG_URL else []
     if len(results) < 3:
-        logger.info("Bing returned few results, trying DDG fallback")
+        bing_results = search_bing(query, count)
+        seen = set(results)
+        for u in bing_results:
+            if u not in seen:
+                results.append(u)
+                seen.add(u)
+    if len(results) < 3:
+        logger.info("Few results so far, trying DDG fallback")
         ddg_results = search_ddg(query, count)
-        # Merge and deduplicate
         seen = set(results)
         for u in ddg_results:
             if u not in seen:
@@ -392,8 +429,9 @@ def health():
     return {
         "status": "ok",
         "service": "PowerScrapper Scraping Engine",
-        "version": "2.1.0",
-        "search_engine": "bing+ddg",
+        "version": "2.2.0",
+        "searxng_url": SEARXNG_URL or "not configured",
+        "search_engine": "searxng+bing+ddg" if SEARXNG_URL else "bing+ddg (searxng not configured)",
     }
 
 @app.post("/crawl")

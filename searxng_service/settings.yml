@@ -32,6 +32,10 @@ engines:
     engine: yandex
     shortcut: y
     disabled: false
+  - name: wikidata
+    engine: wikidata
+    shortcut: wd
+    disabled: true
 
 outgoing:
   request_timeout: 10

@@ -1,5 +1,7 @@
 FROM searxng/searxng:latest
 COPY settings.yml /etc/searxng/settings.yml
-COPY entrypoint.sh /custom-entrypoint.sh
-RUN chmod +x /custom-entrypoint.sh
-ENTRYPOINT ["/custom-entrypoint.sh"]
+# Override Granian defaults for Railway compatibility
+ENV GRANIAN_HOST="0.0.0.0"
+ENV GRANIAN_INTERFACE="wsgi"
+ENV GRANIAN_BLOCKING_THREADS="4"
+# Use the image's own entrypoint — no override

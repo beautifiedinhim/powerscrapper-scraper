@@ -1,7 +1,7 @@
 """
-PowerScrapper — Scraping Engine v2.0
+PowerScrapper — Scraping Engine v2.1
 A focused web scraping and lead extraction service.
-Deploy separately and call from your Base44 app.
+Uses Bing search (no API key needed) + DuckDuckGo fallback.
 
 Endpoints:
   GET  /health  — health check
@@ -18,20 +18,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # ─── Configuration ───────────────────────────────────────────────────────────
-USER_AGENT = "PowerScrapper/2.0 (+responsible-public-web-research)"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 REQUEST_TIMEOUT = 15
 MAX_RETRIES = 3
 RETRY_BACKOFF = 1.5
-CRAWL_DELAY = 0.3  # seconds between requests to same domain
-
-# SearXNG — self-hosted or public instance (no API key needed)
-SEARXNG_URL = os.getenv("SEARXNG_URL", "http://localhost:8080")
-DDG_FALLBACK = os.getenv("DDG_FALLBACK", "true").lower() == "true"
+CRAWL_DELAY = 0.3
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("powerscrapper")
 
-app = FastAPI(title="PowerScrapper Scraping Engine", version="2.0.0")
+app = FastAPI(title="PowerScrapper Scraping Engine", version="2.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -41,7 +37,7 @@ app.add_middleware(
 
 # ─── Request Models ─────────────────────────────────────────────────────────
 class Connector(BaseModel):
-    type: str = "search"  # search | sitemap | url
+    type: str = "search"
     query: str = ""
     url: str = ""
     urls: list[str] = []
@@ -63,22 +59,19 @@ class CrawlRequest(BaseModel):
 
 # ─── Core: robots.txt & fetching ────────────────────────────────────────────
 def robots_ok(url: str) -> bool:
-    """Check if robots.txt allows crawling this URL."""
     p = urlparse(url)
     rp = robotparser.RobotFileParser()
     try:
         rp.set_url(f"{p.scheme}://{p.netloc}/robots.txt")
         rp.read()
-        return rp.can_fetch(USER_AGENT, url)
+        return rp.can_fetch("PowerScrapper", url)
     except Exception:
         return True
 
 def fetch_with_retry(url: str, retries: int = MAX_RETRIES) -> Optional[str]:
-    """Fetch URL with retry logic and exponential backoff."""
     if not robots_ok(url):
         logger.info(f"Robots.txt disallows: {url}")
         return None
-
     for attempt in range(retries):
         try:
             r = requests.get(url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT})
@@ -99,67 +92,56 @@ def fetch_with_retry(url: str, retries: int = MAX_RETRIES) -> Optional[str]:
                 logger.error(f"Failed to fetch {url}: {e}")
     return None
 
-# ─── Search: SearXNG (primary) + DuckDuckGo (fallback) ────────────────────────
-def search_searxng(query: str, count: int) -> list[str]:
-    """
-    Search using a SearXNG instance's JSON API.
-    SearXNG is a privacy-focused metasearch engine — self-host it or use a public instance.
-    No API key needed. Set SEARXNG_URL env var to your instance's base URL.
-    """
-    base = SEARXNG_URL.rstrip("/")
-    try:
-        r = requests.get(
-            f"{base}/search",
-            params={
-                "q": query,
-                "format": "json",
-                "engines": "google,bing,duckduckgo,yandex",
-                "pageno": 1,
-            },
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept": "application/json",
-            },
-            timeout=20,
-        )
-        if r.status_code != 200:
-            logger.warning(f"SearXNG returned {r.status_code}, falling back to DuckDuckGo")
-            return search_ddg(query, count)
-
-        data = r.json()
-        results = data.get("results", [])
-        urls = []
-        for result in results:
-            url = result.get("url", "")
-            if url and url.startswith("http"):
-                urls.append(url)
+# ─── Search: Bing (primary) + DuckDuckGo (fallback) ─────────────────────────
+def search_bing(query: str, count: int) -> list[str]:
+    """Search using Bing HTML — no API key needed."""
+    urls = []
+    pages_to_try = min(3, (count // 10) + 1)
+    for page in range(pages_to_try):
+        try:
+            r = requests.get(
+                "https://www.bing.com/search",
+                params={"q": query, "first": page * 10 + 1},
+                timeout=15,
+                headers={"User-Agent": USER_AGENT},
+            )
+            if r.status_code != 200:
+                break
+            soup = BeautifulSoup(r.text, "html.parser")
+            for li in soup.select("li.b_algo"):
+                cite = li.select_one("cite")
+                if cite:
+                    # cite contains display URL like "example.com › path"
+                    parts = cite.get_text(strip=True).replace(" › ", "/").replace("›", "/")
+                    if not parts.startswith("http"):
+                        parts = "https://" + parts
+                    # Validate it looks like a URL
+                    if "." in parts and not parts.startswith("https://www.bing.com"):
+                        urls.append(parts)
+                if len(urls) >= count:
+                    break
             if len(urls) >= count:
                 break
-        logger.info(f"SearXNG: {len(urls)} results for '{query[:60]}'")
-        return urls
-    except requests.RequestException as e:
-        logger.warning(f"SearXNG error: {e}, falling back to DuckDuckGo")
-        return search_ddg(query, count)
-    except (json.JSONDecodeError, ValueError) as e:
-        logger.warning(f"SearXNG JSON parse error: {e}, falling back to DuckDuckGo")
-        return search_ddg(query, count)
+            time.sleep(0.5)
+        except Exception as e:
+            logger.error(f"Bing search error (page {page}): {e}")
+            break
+    logger.info(f"Bing: {len(urls)} results for '{query[:60]}'")
+    return urls[:count]
 
 def search_ddg(query: str, count: int) -> list[str]:
     """Fallback search using DuckDuckGo HTML endpoint."""
-    if not DDG_FALLBACK:
-        return []
     try:
         r = requests.get(
             "https://html.duckduckgo.com/html/",
             params={"q": query},
             timeout=15,
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers={"User-Agent": USER_AGENT},
         )
         soup = BeautifulSoup(r.text, "html.parser")
         urls = []
         for a in soup.select("a.result__a"):
             href = a.get("href", "")
-            # DDG wraps URLs in a redirect — extract the actual URL
             if "uddg=" in href:
                 parsed = urlparse(href)
                 params = parse_qs(parsed.query)
@@ -169,14 +151,27 @@ def search_ddg(query: str, count: int) -> list[str]:
                 urls.append(href)
             if len(urls) >= count:
                 break
-        logger.info(f"DuckDuckGo fallback: {len(urls)} results for '{query[:60]}'")
+        logger.info(f"DDG fallback: {len(urls)} results for '{query[:60]}'")
         return urls
     except Exception as e:
-        logger.error(f"DuckDuckGo search error: {e}")
+        logger.error(f"DDG search error: {e}")
         return []
 
+def search(query: str, count: int) -> list[str]:
+    """Search with Bing first, DDG fallback."""
+    results = search_bing(query, count)
+    if len(results) < 3:
+        logger.info("Bing returned few results, trying DDG fallback")
+        ddg_results = search_ddg(query, count)
+        # Merge and deduplicate
+        seen = set(results)
+        for u in ddg_results:
+            if u not in seen:
+                results.append(u)
+                seen.add(u)
+    return results[:count]
+
 def get_sitemap_urls(base_url: str, limit: int) -> list[str]:
-    """Fetch URLs from a sitemap.xml."""
     sitemap_url = base_url.rstrip("/") + "/sitemap.xml"
     html = fetch_with_retry(sitemap_url)
     if not html:
@@ -189,7 +184,6 @@ EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", re.I)
 PHONE_RE = re.compile(r"(?:\+?\d[\d\s().-]{7,}\d)")
 
 def extract_jsonld(soup: BeautifulSoup) -> dict:
-    """Extract structured data from JSON-LD <script> tags (schema.org)."""
     data = {}
     for script in soup.find_all("script", type="application/ld+json"):
         try:
@@ -214,7 +208,6 @@ def extract_jsonld(soup: BeautifulSoup) -> dict:
     return data
 
 def extract_microdata(soup: BeautifulSoup) -> dict:
-    """Extract schema.org microdata from HTML elements."""
     data = {}
     for el in soup.find_all(attrs={"itemtype": True}):
         for prop in el.find_all(attrs={"itemprop": True}):
@@ -225,7 +218,6 @@ def extract_microdata(soup: BeautifulSoup) -> dict:
     return data
 
 def text_page(html: str):
-    """Parse HTML → (soup, text, title, meta_description)."""
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript", "svg"]):
         tag.decompose()
@@ -239,39 +231,37 @@ def normalize_phone(v: str) -> str:
     return re.sub(r"\s+", " ", v).strip()
 
 def smart_extract(url: str, html: str, fields: list[dict]) -> tuple[dict, dict]:
-    """
-    Extract lead data from a page.
-    Strategy: structured data (JSON-LD + microdata) first, then regex/text patterns,
-    then label-aware extraction for custom fields.
-    """
     soup, text, title, desc = text_page(html)
     host = urlparse(url).netloc
 
-    # Structured data (JSON-LD takes priority over microdata)
     jsonld = extract_jsonld(soup)
     microdata = extract_microdata(soup)
     structured = {**microdata, **jsonld}
 
-    # Contact extraction from text
     emails = list(dict.fromkeys(EMAIL_RE.findall(text)))
     phones = list(dict.fromkeys(normalize_phone(p) for p in PHONE_RE.findall(text)))[:10]
 
-    # Company name: og:site_name → h1 → title split → structured name
     og_site = soup.find("meta", attrs={"property": "og:site_name"})
     h1 = soup.find("h1")
     company = (
         (og_site.get("content", "").strip() if og_site else "")
         or (h1.get_text(" ", strip=True) if h1 else "")
-        or re.split(r"\s*[|–-]\s*", title)[0].strip()
+        or (title.split(" - ")[0].split(" | ")[0].strip() if title else "")
         or structured.get("name", "")
+        or host.split(".")[0].capitalize()
     )
 
-    # Base data
+    phone_val = (
+        structured.get("telephone", "")
+        or (phones[0] if phones else "")
+    )
+    email_val = structured.get("email", "") or (emails[0] if emails else "")
+
     data = {
-        "company_name": company[:255],
-        "website": f"{urlparse(url).scheme}://{host}",
-        "email": emails[0] if emails else structured.get("email", ""),
-        "phone": phones[0] if phones else structured.get("telephone", ""),
+        "company_name": company,
+        "website": host,
+        "email": email_val,
+        "phone": phone_val,
         "description": (desc or structured.get("description", ""))[:1500],
         "source_url": url,
         "industry": "",
@@ -280,7 +270,6 @@ def smart_extract(url: str, html: str, fields: list[dict]) -> tuple[dict, dict]:
         "country": "",
     }
 
-    # Enrich address from structured data
     if structured.get("streetAddress"):
         data["address"] = structured["streetAddress"]
     if structured.get("addressLocality"):
@@ -293,7 +282,6 @@ def smart_extract(url: str, html: str, fields: list[dict]) -> tuple[dict, dict]:
 
     evidence = {}
 
-    # Custom field extraction
     for f in fields:
         name = (f.get("name") or f.get("label") or "").strip()
         label = (f.get("label") or name).lower()
@@ -304,9 +292,9 @@ def smart_extract(url: str, html: str, fields: list[dict]) -> tuple[dict, dict]:
 
         if any(x in aliases for x in ["email", "e-mail", "mail"]):
             value = data["email"]
-        elif any(x in aliases for x in ["phone", "telephone", "mobile", "whatsapp", "contact number"]):
+        elif any(x in aliases for x in ["phone", "telephone", "mobile", "whatsapp"]):
             value = data["phone"]
-        elif any(x in aliases for x in ["company", "business name", "organisation", "organization", "brand"]):
+        elif any(x in aliases for x in ["company", "business name", "organisation"]):
             value = data["company_name"]
         elif any(x in aliases for x in ["website", "url", "domain"]):
             value = data["website"]
@@ -316,16 +304,15 @@ def smart_extract(url: str, html: str, fields: list[dict]) -> tuple[dict, dict]:
             value = data["country"] or (
                 m.group(1).strip() if (m := re.search(r"(?:country|pays)\s*[:\-]\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ .'-]{2,60})", text, re.I)) else ""
             )
-        elif any(x in aliases for x in ["city", "ville", "location", "localisation"]):
+        elif any(x in aliases for x in ["city", "ville", "location"]):
             value = data["city"] or (
                 m.group(1).strip() if (m := re.search(r"(?:city|ville|location)\s*[:\-]\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ .'-]{2,60})", text, re.I)) else ""
             )
-        elif any(x in aliases for x in ["industry", "sector", "activité", "secteur"]):
+        elif any(x in aliases for x in ["industry", "sector"]):
             value = (
-                m.group(1).strip() if (m := re.search(r"(?:industry|sector|secteur|activité)\s*[:\-]\s*([^|.;]{3,80})", text, re.I)) else ""
+                m.group(1).strip() if (m := re.search(r"(?:industry|sector)\s*[:\-]\s*([^|.;]{3,80})", text, re.I)) else ""
             )
         else:
-            # Label-aware extraction from visible text / definition lists
             rx = re.compile(re.escape(label.replace("_", " ")) + r"\s*[:\-]\s*([^|;\n]{2,180})", re.I)
             m = rx.search(text)
             value = m.group(1).strip() if m else ""
@@ -340,7 +327,6 @@ def smart_extract(url: str, html: str, fields: list[dict]) -> tuple[dict, dict]:
     return data, evidence
 
 def score_lead(lead: dict, objective: str) -> float:
-    """Score a lead based on data completeness and objective relevance."""
     s = 0
     if lead.get("company_name"): s += 20
     if lead.get("website"): s += 10
@@ -356,7 +342,6 @@ def score_lead(lead: dict, objective: str) -> float:
 
 # ─── Discovery & Crawling ────────────────────────────────────────────────────
 def discover_urls(req: CrawlRequest, limit: int) -> list[str]:
-    """Discover starting URLs from connectors."""
     urls = []
     for c in req.connectors:
         if c.type == "url":
@@ -365,16 +350,15 @@ def discover_urls(req: CrawlRequest, limit: int) -> list[str]:
             urls.extend(get_sitemap_urls(c.url, limit))
         elif c.type == "search":
             q = c.query or " ".join(req.keywords + req.locations) or "business companies"
-            urls.extend(search_searxng(q, limit))
+            urls.extend(search(q, limit))
 
     if not urls:
         q = " ".join(req.keywords + req.locations) or "business companies"
-        urls = search_searxng(q, limit)
+        urls = search(q, limit)
 
     return list(dict.fromkeys(urls))[:limit]
 
 def crawl(start_urls: list[str], max_depth: int, cap: int) -> list[tuple[str, str]]:
-    """Bounded same-domain crawling with deduplication."""
     queue = [(u, 0) for u in start_urls]
     seen: set[str] = set()
     pages: list[tuple[str, str]] = []
@@ -408,27 +392,23 @@ def health():
     return {
         "status": "ok",
         "service": "PowerScrapper Scraping Engine",
-        "version": "2.0.0",
-        "searxng_url": SEARXNG_URL,
+        "version": "2.1.0",
+        "search_engine": "bing+ddg",
     }
 
 @app.post("/crawl")
 def crawl_endpoint(req: CrawlRequest):
-    """Main crawling endpoint. Takes mission config, returns extracted leads."""
     start_time = time.time()
     logger.info(f"Starting crawl: {req.objective[:80]} | max_results={req.max_results} depth={req.max_depth}")
 
     fields = [f.model_dump() for f in req.custom_fields]
 
-    # 1. Discover URLs
     start_urls = discover_urls(req, req.max_results)
     logger.info(f"Discovered {len(start_urls)} starting URLs")
 
-    # 2. Crawl
     pages = crawl(start_urls, req.max_depth, req.max_results * 2)
     logger.info(f"Crawled {len(pages)} pages")
 
-    # 3. Extract leads
     leads = []
     seen_hosts: set[str] = set()
 
